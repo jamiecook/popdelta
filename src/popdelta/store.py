@@ -4,7 +4,7 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pandas as pd
 
@@ -62,7 +62,7 @@ class PopulationStore:
     def apply_delta(self, name: str) -> None:
         delta_path = self.deltas_path / name
         manifest_path = delta_path / "manifest.json"
-        manifest = json.loads(manifest_path.read_text())
+        manifest = cast(dict[str, Any], json.loads(manifest_path.read_text()))
         population = self.read()
         tables = {name: getattr(population, name).copy() for name in _TABLE_NAMES}
 
@@ -88,9 +88,44 @@ class PopulationStore:
         return [name for _, name in sorted(deltas)]
 
     def create_delta(self, name: str) -> Path:
-        delta_path = self.deltas_path / f"{len(self.delta_names()) + 1}_{name}"
+        numbers = [self._delta_id(delta) for delta in self.delta_names()]
+        next_id = max(numbers, default=0) + 1
+        delta_path = self.deltas_path / f"{next_id}_{name}"
         delta_path.mkdir()
         return delta_path
+
+    def add_to_current_delta(self, table: str, rows: dict[str, pd.DataFrame]) -> None:
+        if table not in _TABLE_NAMES:
+            raise ValueError(f"Unknown population table: {table}")
+        delta_names = self.delta_names()
+        if not delta_names:
+            raise ValueError("No current delta exists")
+        delta_path = self.deltas_path / delta_names[-1]
+        manifest_path = delta_path / "manifest.json"
+        if manifest_path.exists():
+            manifest = cast(dict[str, Any], json.loads(manifest_path.read_text()))
+        else:
+            manifest = {"name": delta_names[-1], "tables": {}}
+        tables = cast(dict[str, list[dict[str, Any]]], manifest.setdefault("tables", {}))
+        operations = tables.setdefault(table, [])
+        for action, frame in rows.items():
+            if action not in {"add", "delete"}:
+                raise ValueError(f"Unsupported row action: {action}")
+            if not isinstance(frame, pd.DataFrame):
+                raise TypeError("Delta rows must be pandas DataFrames")
+            operation = "add_rows" if action == "add" else "delete_rows"
+            file_name = f"{table}/{action}_rows_{len(operations)}.parquet"
+            (delta_path / table).mkdir(parents=True, exist_ok=True)
+            frame.to_parquet(delta_path / file_name, index=False)
+            operations.append({operation: file_name})
+        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+
+    def commit_current_delta(self) -> Population:
+        delta_names = self.delta_names()
+        if not delta_names:
+            raise ValueError("No current delta exists")
+        self.apply_delta(delta_names[-1])
+        return self.read()
 
     def apply_deltas(self) -> None:
         for name in self.delta_names():
@@ -141,3 +176,10 @@ class PopulationStore:
     def _write_population(self, population: Population) -> None:
         for name in _TABLE_NAMES:
             getattr(population, name).to_parquet(self.current_state_path / f"{name}.parquet", index=False)
+
+    @staticmethod
+    def _delta_id(name: str) -> int:
+        match = _DELTA_NAME.fullmatch(name)
+        if match is None:
+            raise ValueError(f"Delta directory must be named '<number>_<name>': {name}")
+        return int(match.group(1))

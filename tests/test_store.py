@@ -51,6 +51,23 @@ def test_create_initializes_population_directory(tmp_path):
     assert (population_dir / "deltas" / "2_second_commit").exists()
     assert len(list((population_dir / "deltas" / "2_second_commit").iterdir())) == 0
 
+    store.add_to_current_delta(
+        table="persons",
+        rows={"add": pd.DataFrame({"person_id": [6], "household_id": [2], "age": [0], "obsolete_field": [False]})},
+    )
+
+    # Before committing the current delta, the original population should remain unchanged.
+    assert population.persons.shape[0] == 5
+
+    # Running the commit
+    # 1) applies the changes to the current state,
+    # 2) persists everything to the filesystem and
+    # 3) returns the new population.
+    new_pop = store.commit_current_delta()
+    assert new_pop.persons.shape[0] == 6
+    assert store.delta_names() == ["1_initial_commit", "2_second_commit"]
+    assert Population.from_dir(population_dir / "current_state") == new_pop
+
 
 def test_delta_directories_are_sorted_by_numeric_id(tmp_path):
     store = PopulationStore.create(tmp_path / "population", make_population())
