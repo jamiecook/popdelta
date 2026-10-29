@@ -237,6 +237,12 @@ def test_keyed_columns_whole_table_updates_and_play_commits(tmp_path):
 
     # Row deletion only wrote an updated index in 2_2025 while inheriting household_id from 1_initial_commit
     manifest_2025 = json.loads((store.deltas_path / "2_2025" / "manifest.json").read_text())
+    assert manifest_2025["tables"]["persons"][0] == {
+        "replace_columns": {"file": "persons/replace_age_0.parquet", "columns": ["age"]}
+    }
+    assert manifest_2025["tables"]["persons"][2] == {
+        "add_columns": {"file": "persons/add_score_2.parquet", "columns": ["score"]}
+    }
     assert manifest_2025["state"]["households"] == "1_initial_commit"
     assert manifest_2025["state"]["vehicles"] == "1_initial_commit"
     assert manifest_2025["state"]["persons"]["index"] == "2_2025/persons/index.parquet"
@@ -245,6 +251,7 @@ def test_keyed_columns_whole_table_updates_and_play_commits(tmp_path):
         "obsolete_field",
     ]
     assert manifest_2025["state"]["persons"]["files"]["2_2025/persons/replace_age_0.parquet"] == ["age"]
+    assert manifest_2025["state"]["persons"]["files"]["2_2025/persons/col_2.parquet"] == ["score"]
 
     # Commit 3 ("2030"): Whole-table replacement for vehicles (e.g. from a fleet model)
     store.create_delta("2030")
@@ -368,8 +375,6 @@ def test_multi_column_set_files_and_one_hop_state_compaction(tmp_path):
     # Replace all remaining columns from 1_initial_commit/persons.parquet + delete obsolete_field:
     # 1_initial_commit/persons.parquet should drop out of `files` once none of its non-key columns remain live
     store.create_delta("2030_update")
-    with pytest.raises(NotImplementedError, match="Automatic table diffing"):
-        store.add_to_current_delta(table="persons", table_data=make_population().persons, diff_table=True)
     store.add_to_current_delta(
         table="persons",
         columns={
@@ -408,3 +413,59 @@ def test_multi_column_set_files_and_one_hop_state_compaction(tmp_path):
     (store.deltas_path / "3_2030_update" / "manifest.json").write_text(json.dumps(manifest_3))
     with pytest.raises(ValueError, match="must resolve to a state block in one hop"):
         store.play_commits(upto="2030_update")
+
+
+def test_column_validation_and_store_format_checks(tmp_path):
+    store = PopulationStore.create(
+        tmp_path / "population",
+        make_population(),
+        table_keys={"vehicles": ("household_id", "vehicle_id")},
+    )
+
+    # Non-serializable metadata fails before creating an orphaned delta directory
+    with pytest.raises(TypeError):
+        store.create_delta("bad_meta", metadata={"bad": {1, 2, 3}})
+    assert store.delta_names() == ["1_initial_commit"]
+
+    # Round-trip _dump_json with strings containing brackets, commas, and escaped quotes
+    tricky = {
+        "note": 'values like ["a", "b"], [1, 2], and "escaped" quotes',
+        "list": ["alpha", 'beta "quoted"', "gamma, [delta]"],
+    }
+    assert json.loads(PopulationStore._dump_json(tricky)) == tricky
+
+    store.create_delta("validation_checks")
+
+    # Headless multi-column DataFrames are rejected (require keys for column sets)
+    with pytest.raises(ValueError, match="Multi-column DataFrames must include key column"):
+        store.add_to_current_delta(
+            table="persons",
+            columns={"add": pd.DataFrame({"col_a": [1, 2, 3, 4, 5], "col_b": [6, 7, 8, 9, 10]})},
+        )
+
+    # Partial composite key reports the missing key column clearly
+    with pytest.raises(ValueError, match=r"Missing key column\(s\): \['vehicle_id'\]"):
+        store.add_to_current_delta(
+            table="vehicles",
+            columns={"add": pd.DataFrame({"household_id": [1, 2], "powertrain": ["bev", "icev"]})},
+        )
+
+    # Enforce add vs. replace column existence semantics
+    with pytest.raises(ValueError, match=r"Cannot replace unknown column\(s\) \['nonexistent'\]"):
+        store.add_to_current_delta(
+            table="persons",
+            columns={"replace": pd.DataFrame({"person_id": [1, 2, 3, 4, 5], "nonexistent": [1, 2, 3, 4, 5]})},
+        )
+    with pytest.raises(ValueError, match=r"Cannot add existing column\(s\) \['age'\]"):
+        store.add_to_current_delta(
+            table="persons",
+            columns={"add": pd.DataFrame({"person_id": [1, 2, 3, 4, 5], "age": [21, 19, 46, 43, 13]})},
+        )
+
+    # Verify store.json format version check and missing store.json error
+    store.store_metadata_path.write_text(json.dumps({"format": 99, "tables": {}}))
+    with pytest.raises(ValueError, match="Unsupported population store format: 99"):
+        store.play_commits()
+    store.store_metadata_path.unlink()
+    with pytest.raises(ValueError, match="Population store predates format 1"):
+        store.play_commits()
