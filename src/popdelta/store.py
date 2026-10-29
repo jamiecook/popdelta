@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import copy
 import json
 import re
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -52,12 +54,21 @@ class PopulationStore:
         store.deltas_path.mkdir()
         initial_delta_path = store.deltas_path / "1_initial_commit"
         initial_delta_path.mkdir()
+        state = {
+            name: {
+                "key": keys[name],
+                "index": f"1_initial_commit/{name}.parquet",
+                "columns": dict.fromkeys(population.table(name).columns, f"1_initial_commit/{name}.parquet"),
+            }
+            for name in _TABLE_NAMES
+        }
         (initial_delta_path / "manifest.json").write_text(
             json.dumps(
                 {
                     "name": "Initial commit",
-                    "keys": keys,
+                    "parents": [],
                     "tables": {name: [] for name in _TABLE_NAMES},
+                    "state": state,
                 },
                 indent=2,
             )
@@ -75,25 +86,46 @@ class PopulationStore:
         }
         return Population(**tables)
 
+    def play_commits(
+        self,
+        upto: str | int | None = None,
+        *,
+        columns: dict[str, list[str]] | None = None,
+    ) -> Population:
+        target_delta = self._resolve_delta(upto)
+        manifest = self._load_manifest_state(target_delta)
+        return self._read_from_state(manifest, columns=columns)
+
     def apply_delta(self, name: str) -> None:
         delta_path = self.deltas_path / name
         manifest_path = delta_path / "manifest.json"
         manifest = cast(dict[str, Any], json.loads(manifest_path.read_text()))
-        population = self.read()
-        tables = {table_name: population.table(table_name).copy() for table_name in _TABLE_NAMES}
+        if "state" in manifest:
+            self._write_population(self._read_from_state(manifest["state"]))
+            return
         deltas = self.delta_names()
         idx = deltas.index(name)
-        seen_keys = self._collect_historical_keys(deltas[:idx], manifest["tables"])
+        parents = [deltas[idx - 1]] if idx > 0 else []
+        parent_state = self._load_manifest_state(parents[0] if parents else name)
+        population = self._read_from_state(parent_state) if parents else self.read()
+        tables = {table_name: population.table(table_name).copy() for table_name in _TABLE_NAMES}
+        seen_keys = self._collect_historical_keys(deltas[:idx], parent_state, manifest["tables"])
 
         for table_name, operations in manifest["tables"].items():
             if table_name not in tables:
                 raise ValueError(f"Unknown population table: {table_name}")
-            key_cols = self._table_keys_for_latest(deltas, table_name)
+            key_cols = list(parent_state[table_name]["key"])
             tables[table_name] = self._apply_operations(
                 tables[table_name], operations, delta_path, key_cols, seen_keys.get(table_name)
             )
 
-        self._write_population(Population(**tables))
+        updated_population = Population(**tables)
+        manifest["parents"] = parents
+        manifest["state"] = self._build_next_state(
+            name, delta_path, parent_state, manifest["tables"], updated_population
+        )
+        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+        self._write_population(updated_population)
 
     def delta_names(self) -> list[str]:
         deltas = []
@@ -110,11 +142,20 @@ class PopulationStore:
         return [name for _, name in sorted(deltas)]
 
     def create_delta(self, name: str) -> Path:
-        numbers = [self._delta_id(delta) for delta in self.delta_names()]
+        deltas = self.delta_names()
+        if deltas and not self._has_state(deltas[-1]):
+            raise ValueError(f"Delta {deltas[-1]!r} has not been committed; commit or discard it first")
+        numbers = [self._delta_id(delta) for delta in deltas]
         next_id = max(numbers, default=0) + 1
         delta_path = self.deltas_path / f"{next_id}_{name}"
         delta_path.mkdir()
         return delta_path
+
+    def discard_current_delta(self) -> None:
+        deltas = self.delta_names()
+        if not deltas or self._has_state(deltas[-1]):
+            raise ValueError("No uncommitted delta to discard")
+        shutil.rmtree(self.deltas_path / deltas[-1])
 
     def add_to_current_delta(
         self,
@@ -341,26 +382,128 @@ class PopulationStore:
             frame[column] = col_df[column].array
         return frame
 
+    @staticmethod
+    def _build_next_state(
+        delta_name: str,
+        delta_path: Path,
+        parent_state: dict[str, Any],
+        operations_by_table: dict[str, list[dict[str, Any]]],
+        updated_population: Population,
+    ) -> dict[str, Any]:
+        next_state = copy.deepcopy(parent_state)
+        for table_name, operations in operations_by_table.items():
+            if not operations:
+                continue
+            table_state = next_state[table_name]
+            key_cols = list(table_state["key"])
+            updated_frame = updated_population.table(table_name)
+            if len(operations) == 1 and "replace_table" in operations[0]:
+                rel_state = f"{delta_name}/{operations[0]['replace_table']}"
+                table_state["index"] = rel_state
+                table_state["columns"] = dict.fromkeys(updated_frame.columns, rel_state)
+                continue
+
+            op_kinds = {next(iter(op)) for op in operations}
+            if "replace_table" in op_kinds or "add_rows" in op_kinds:
+                state_file = f"{table_name}/state.parquet"
+                (delta_path / table_name).mkdir(parents=True, exist_ok=True)
+                updated_frame.to_parquet(delta_path / state_file, index=False)
+                rel_state = f"{delta_name}/{state_file}"
+                table_state["index"] = rel_state
+                table_state["columns"] = dict.fromkeys(updated_frame.columns, rel_state)
+                continue
+
+            if "delete_rows" in op_kinds:
+                index_file = f"{table_name}/index.parquet"
+                (delta_path / table_name).mkdir(parents=True, exist_ok=True)
+                updated_frame[key_cols].to_parquet(delta_path / index_file, index=False)
+                rel_index = f"{delta_name}/{index_file}"
+                table_state["index"] = rel_index
+                for k_col in key_cols:
+                    table_state["columns"][k_col] = rel_index
+
+            PopulationStore._update_column_pointers(
+                delta_name, delta_path, table_name, operations, table_state, key_cols, updated_frame
+            )
+
+        return next_state
+
+    @staticmethod
+    def _update_column_pointers(
+        delta_name: str,
+        delta_path: Path,
+        table_name: str,
+        operations: list[dict[str, Any]],
+        table_state: dict[str, Any],
+        key_cols: list[str],
+        updated_frame: pd.DataFrame,
+    ) -> None:
+        for op in operations:
+            action, value = next(iter(op.items()))
+            if action == "delete_columns":
+                for col in value:
+                    table_state["columns"].pop(col, None)
+                continue
+            if action not in {"replace_columns", "add_columns"}:
+                continue
+            items = value.items() if action == "replace_columns" else [(None, value)]
+            for col_hint, rel_op_path in items:
+                op_df = pd.read_parquet(delta_path / rel_op_path)
+                col = col_hint or next(str(c) for c in op_df.columns if c not in key_cols)
+                if set(key_cols).issubset(op_df.columns) and len(op_df.columns) == len(key_cols) + 1:
+                    table_state["columns"][col] = f"{delta_name}/{rel_op_path}"
+                else:
+                    state_col_rel = f"{table_name}/col_{col}.parquet"
+                    (delta_path / table_name).mkdir(parents=True, exist_ok=True)
+                    updated_frame[[*key_cols, col]].to_parquet(delta_path / state_col_rel, index=False)
+                    table_state["columns"][col] = f"{delta_name}/{state_col_rel}"
+
+    def _read_from_state(
+        self,
+        state: dict[str, Any],
+        *,
+        columns: dict[str, list[str]] | None = None,
+    ) -> Population:
+        if columns is not None and (unknown := set(columns) - set(_TABLE_NAMES)):
+            raise ValueError(f"Unknown population table(s): {sorted(unknown)}")
+
+        tables: dict[str, pd.DataFrame] = {}
+        for table_name in _TABLE_NAMES:
+            table_state = state[table_name]
+            key_cols: list[str] = list(table_state["key"])
+            col_map: dict[str, str] = table_state["columns"]
+            req_cols = list(columns[table_name]) if columns and table_name in columns else list(col_map.keys())
+            if missing := [col for col in req_cols if col not in col_map]:
+                raise ValueError(f"Unknown column(s) {missing} for table {table_name!r}")
+            target_cols = [*(k for k in key_cols if k not in req_cols), *req_cols]
+
+            base_df = pd.read_parquet(self.deltas_path / table_state["index"], columns=key_cols).copy()
+            cols_by_source: dict[str, list[str]] = {}
+            for col in target_cols:
+                if col not in key_cols:
+                    cols_by_source.setdefault(col_map[col], []).append(col)
+
+            for rel_source, source_cols in cols_by_source.items():
+                piece = pd.read_parquet(self.deltas_path / rel_source, columns=[*key_cols, *source_cols])
+                base_df = base_df.merge(piece, on=key_cols, how="left", validate="one_to_one")
+
+            tables[table_name] = base_df[target_cols].reset_index(drop=True)
+
+        return Population(**tables)
+
     def _collect_historical_keys(
         self,
         prior_deltas: list[str],
+        fallback_state: dict[str, Any],
         operations_by_table: dict[str, list[dict[str, Any]]],
     ) -> dict[str, pd.DataFrame]:
         seen: dict[str, pd.DataFrame] = {}
-        deltas = self.delta_names()
         for name, ops in operations_by_table.items():
             if not any("add_rows" in op or "replace_table" in op for op in ops):
                 continue
-            key_cols = self._table_keys_for_latest(deltas, name)
-            init_path = self.deltas_path / prior_deltas[0] / f"{name}.parquet"
-            frames = [pd.read_parquet(init_path, columns=key_cols)] if prior_deltas else []
-            for d in prior_deltas[1:]:
-                manifest = json.loads((self.deltas_path / d / "manifest.json").read_text())
-                for op in manifest.get("tables", {}).get(name, []):
-                    if "add_rows" in op:
-                        frames.append(pd.read_parquet(self.deltas_path / d / op["add_rows"], columns=key_cols))
-                    elif "replace_table" in op:
-                        frames.append(pd.read_parquet(self.deltas_path / d / op["replace_table"], columns=key_cols))
+            key_cols = list(fallback_state[name]["key"])
+            index_paths = dict.fromkeys(self._load_manifest_state(d)[name]["index"] for d in prior_deltas)
+            frames = [pd.read_parquet(self.deltas_path / rel, columns=key_cols) for rel in index_paths]
             seen[name] = (
                 pd.concat(frames, ignore_index=True).drop_duplicates() if frames else pd.DataFrame(columns=key_cols)
             )
@@ -369,9 +512,43 @@ class PopulationStore:
     def _table_keys_for_latest(self, delta_names: list[str], table: str) -> list[str]:
         for delta in reversed(delta_names):
             manifest_path = self.deltas_path / delta / "manifest.json"
-            if manifest_path.exists() and "keys" in (data := json.loads(manifest_path.read_text())):
-                return list(data["keys"][table])
+            if manifest_path.exists() and "state" in (data := json.loads(manifest_path.read_text())):
+                return list(data["state"][table]["key"])
         return list(_DEFAULT_TABLE_KEYS[table])
+
+    def _has_state(self, delta_name: str) -> bool:
+        manifest_path = self.deltas_path / delta_name / "manifest.json"
+        return manifest_path.exists() and "state" in json.loads(manifest_path.read_text())
+
+    def _load_manifest_state(self, delta_name: str) -> dict[str, Any]:
+        manifest_path = self.deltas_path / delta_name / "manifest.json"
+        if not manifest_path.exists():
+            raise ValueError(f"Delta {delta_name!r} has not been committed")
+        manifest = cast(dict[str, Any], json.loads(manifest_path.read_text()))
+        if "state" not in manifest:
+            if "tables" in manifest and self._has_state(self.delta_names()[0]):
+                raise ValueError(f"Delta {delta_name!r} has not been committed")
+            raise ValueError(f"Delta {delta_name!r} predates state manifests; recreate the store")
+        return cast(dict[str, Any], manifest["state"])
+
+    def _resolve_delta(self, upto: str | int | None) -> str:
+        deltas = self.delta_names()
+        if upto is None:
+            committed = [d for d in deltas if self._has_state(d)]
+            return committed[-1] if committed else deltas[-1]
+        if upto in deltas:
+            return str(upto)
+        target = str(upto)
+        matches = [
+            d
+            for d in deltas
+            if d.split("_", 1)[1] == target or (target.isdigit() and self._delta_id(d) == int(target))
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise ValueError(f"Ambiguous delta reference {upto!r}: {matches}")
+        raise ValueError(f"Unknown delta reference: {upto!r}")
 
     @staticmethod
     def _normalize_keyed(frame: pd.DataFrame, key_cols: list[str]) -> pd.DataFrame:

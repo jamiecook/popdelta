@@ -5,7 +5,9 @@
 A population is a collection of related tables, such as households, persons, and vehicles. A
 population delta describes how one population state becomes the next: rows may be added or removed,
 and columns may be added, removed, or replaced. This makes an evolution from one simulation year to
-the next inspectable and reproducible, much like a commit records a change to source code.
+the next inspectable and reproducible, much like a commit records a change to source code. Like a
+commit, each delta also records the full state it produces, so any earlier population can be read
+back directly without replaying history.
 
 ## Installation
 
@@ -23,8 +25,11 @@ uv sync --extra dev
 ## Population model
 
 `Population` is a lightweight immutable container for related population tables. It does not impose
-an ID scheme, schema, derived fields, or domain-specific assumptions; those belong to the deltas and
-validation rules that will be added on top of it.
+a schema, derived fields, or domain-specific assumptions; those belong to the deltas and validation
+rules that will be added on top of it. `PopulationStore` does require a key that identifies each row
+of each table. The defaults are `household_id`, `person_id`, and `vehicle_id`, and
+`PopulationStore.create(..., table_keys={"vehicles": ("household_id", "vehicle_id")})` overrides
+them, including with composite keys.
 
 ```python
 import pandas as pd
@@ -71,14 +76,14 @@ store.add_to_current_delta(
 )
 pop2 = store.commit_current_delta()
 
-current_age = pop2.persons["age"].copy()
+current_ages = pop2.persons[["person_id", "age"]].copy()
 store.create_delta("column_manipulation")
 store.add_to_current_delta(
     table="persons",
     columns={
-        "replace": current_age + 2,
+        "replace": current_ages.assign(age=current_ages["age"] + 2),
         "delete": ["obsolete_field"],
-        "add": pd.DataFrame({"new_column": [1, 1, 1, 1, 1, 1]}),
+        "add": pd.DataFrame({"person_id": pop2.persons["person_id"], "new_column": 1}),
     },
 )
 pop3 = store.commit_current_delta()
@@ -102,43 +107,101 @@ population/
     ├── 2_second_commit/
     │   ├── manifest.json
     │   └── persons/
-    │       └── add_rows_0.parquet
+    │       ├── add_rows_0.parquet
+    │       └── state.parquet
     └── 3_column_manipulation/
         ├── manifest.json
         └── persons/
-            ├── add_new_column_1.parquet
+            ├── add_new_column_2.parquet
             └── replace_age_0.parquet
 ```
 
-Each delta has a JSON manifest. The table operation list preserves order, so a replacement column
-can contain exactly one value for each row created by an earlier `add_rows` operation:
+Each delta has a JSON manifest. The `tables` operation list records what changed and preserves order,
+so a replacement column can cover rows created by an earlier `add_rows` operation. The `state` block
+records the result: for each table, the file holding its current keys (`index`) and the file that
+last wrote each active column. Tables and columns the delta did not touch keep pointing at earlier
+deltas, so nothing is copied:
 
 ```json
 {
-  "name": "Evolve to 2030",
-  "date_generated": "2026-10-12T09:00:00",
+  "name": "3_column_manipulation",
+  "parents": ["2_second_commit"],
   "tables": {
     "persons": [
-      {"add_rows": "persons/add_rows_0.parquet"},
-      {"delete_rows": "persons/deleted_rows.parquet"},
-      {"replace_columns": {"age": "persons/replacement_age.parquet"}},
-      {"delete_columns": ["obsolete_field"]}
+      {"replace_columns": {"age": "persons/replace_age_0.parquet"}},
+      {"delete_columns": ["obsolete_field"]},
+      {"add_columns": "persons/add_new_column_2.parquet"}
     ]
+  },
+  "state": {
+    "households": {
+      "key": ["household_id"],
+      "index": "1_initial_commit/households.parquet",
+      "columns": {"household_id": "1_initial_commit/households.parquet"}
+    },
+    "persons": {
+      "key": ["person_id"],
+      "index": "2_second_commit/persons/state.parquet",
+      "columns": {
+        "person_id": "2_second_commit/persons/state.parquet",
+        "household_id": "2_second_commit/persons/state.parquet",
+        "age": "3_column_manipulation/persons/replace_age_0.parquet",
+        "new_column": "3_column_manipulation/persons/add_new_column_2.parquet"
+      }
+    },
+    "vehicles": {
+      "key": ["vehicle_id"],
+      "index": "1_initial_commit/vehicles.parquet",
+      "columns": {
+        "vehicle_id": "1_initial_commit/vehicles.parquet",
+        "household_id": "1_initial_commit/vehicles.parquet"
+      }
+    }
   }
 }
 ```
 
-`add_rows` and `delete_rows` refer to Parquet tables. A replacement Parquet file contains one named
-column and must have exactly one value for every row present when its operation is reached. Applying
-a delta updates `current_state/`:
+`add_rows` and `delete_rows` refer to Parquet tables. Deleting rows writes only a new key index, and
+existing column files stay valid. A column file contains the table's key columns plus one named
+column, and it is matched to rows by key rather than by position. A plain Series is still accepted
+and is assigned in key order. Tables are always stored and returned sorted by key. Keys must be
+unique and non-null, and a key that has been deleted cannot be reused by a later delta.
+
+Models that write complete tables can commit them directly instead of computing a diff:
 
 ```python
-store.apply_delta("evolve-to-2030")
+store.create_delta("2025_fleet")
+store.add_to_current_delta(table="vehicles", table_data=new_vehicles)
+store.commit_current_delta()
+```
+
+Applying a delta updates `current_state/`, which is a materialized copy of the latest delta. The
+manifests remain the source of truth:
+
+```python
+store.apply_delta("3_column_manipulation")
 ```
 
 Delta directories start with a unique numeric ID followed by an underscore and descriptive name.
 `store.delta_names()` returns them in numeric order, and `store.apply_deltas()` applies every delta
 in that order.
+
+## Reading earlier states
+
+Any committed population can be read straight from its manifest:
+
+```python
+pop_second = store.play_commits(upto="second_commit")
+```
+
+`upto` accepts a full delta directory name (`"2_second_commit"`), a numeric ID or year (`2` or
+`2025`), or a descriptive name (`"second_commit"`). An ambiguous reference raises an error instead
+of guessing. Pass `columns=` to read only what you need. Only the files holding the requested
+columns are opened, and primary key columns are always included automatically:
+
+```python
+ages = store.play_commits(upto="second_commit", columns={"persons": ["age"]})
+```
 
 ## Development
 

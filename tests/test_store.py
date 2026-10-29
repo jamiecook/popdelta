@@ -34,6 +34,23 @@ def write_delta(store: PopulationStore, name: str, operations: list[dict], files
     )
 
 
+def replay_operations_from_genesis(store: PopulationStore, upto: str) -> Population:
+    """Reference sequential operation replay from 1_initial_commit without using manifest['state']."""
+    deltas = store.delta_names()
+    initial_state = json.loads((store.deltas_path / deltas[0] / "manifest.json").read_text())["state"]
+    key_cols = {name: list(initial_state[name]["key"]) for name in ("households", "persons", "vehicles")}
+    initial = Population.from_dir(store.deltas_path / deltas[0])
+    tables = {name: initial.table(name).copy() for name in ("households", "persons", "vehicles")}
+    for delta_name in deltas[1 : deltas.index(upto) + 1]:
+        delta_path = store.deltas_path / delta_name
+        manifest = json.loads((delta_path / "manifest.json").read_text())
+        for table_name, ops in manifest.get("tables", {}).items():
+            tables[table_name] = PopulationStore._apply_operations(
+                tables[table_name], ops, delta_path, key_cols=key_cols[table_name]
+            )
+    return Population(**tables)
+
+
 def test_create_initializes_population_directory(tmp_path):
     population_dir = tmp_path / "population"
     population = make_population()
@@ -104,6 +121,14 @@ def test_create_initializes_population_directory(tmp_path):
     assert 6 not in pop4.persons["person_id"].values
     assert all(pop4.persons["age"] == current_age[:-1] + 3)
 
+    # Verify play_commits(upto=...) matches every historical snapshot and equals full replay
+    assert store.play_commits(upto="1_initial_commit") == population
+    assert store.play_commits(upto="second_commit") == pop2
+    assert store.play_commits(upto=3) == pop3
+    assert store.play_commits(upto="4_conflicting rows cols") == pop4
+    for delta_name in store.delta_names():
+        assert store.play_commits(upto=delta_name) == replay_operations_from_genesis(store, delta_name)
+
 
 def test_delta_directories_are_sorted_by_numeric_id(tmp_path):
     store = PopulationStore.create(tmp_path / "population", make_population())
@@ -158,7 +183,7 @@ def test_replace_column_requires_a_value_for_each_current_row(tmp_path):
         store.apply_delta("2_invalid-age-update")
 
 
-def test_keyed_columns_and_whole_table_updates(tmp_path):
+def test_keyed_columns_whole_table_updates_and_play_commits(tmp_path):
     store = PopulationStore.create(
         tmp_path / "population",
         make_population(),
@@ -210,6 +235,11 @@ def test_keyed_columns_and_whole_table_updates(tmp_path):
     assert isinstance(pop_2025.persons["status"].dtype, pd.CategoricalDtype)
     assert str(pop_2025.persons["score"].dtype) == "Int64"
 
+    # Row deletion only wrote an updated index in 2_2025 while inheriting household_id from 1_initial_commit
+    manifest_2025 = json.loads((store.deltas_path / "2_2025" / "manifest.json").read_text())
+    assert manifest_2025["state"]["persons"]["index"] == "2_2025/persons/index.parquet"
+    assert manifest_2025["state"]["persons"]["columns"]["household_id"] == "1_initial_commit/persons.parquet"
+
     # Commit 3 ("2030"): Whole-table replacement for vehicles (e.g. from a fleet model)
     store.create_delta("2030")
     new_vehicles = pd.DataFrame(
@@ -221,16 +251,26 @@ def test_keyed_columns_and_whole_table_updates(tmp_path):
     )
     store.add_to_current_delta(table="vehicles", table_data=new_vehicles)
     pop_2030 = store.commit_current_delta()
-    pdt.assert_frame_equal(
-        pop_2030.vehicles,
-        pd.DataFrame(
-            {
-                "vehicle_id": [1, 2, 10],
-                "household_id": [1, 2, 2],
-                "powertrain": ["icev", "phev", "bev"],
-            }
-        ),
-    )
+
+    # Single replace_table op points state directly at replace_table_0.parquet without duplicating state.parquet
+    manifest_2030 = json.loads((store.deltas_path / "3_2030" / "manifest.json").read_text())
+    assert manifest_2030["state"]["vehicles"]["index"] == "3_2030/vehicles/replace_table_0.parquet"
+    assert not (store.deltas_path / "3_2030/vehicles/state.parquet").exists()
+
+    # Arbitrary commit checkout via play_commits(upto="2025") and integer year play_commits(upto=2025)
+    replayed_2025 = store.play_commits(upto="2025")
+    assert replayed_2025 == pop_2025
+    assert store.play_commits(upto=2025) == pop_2025
+    assert store.play_commits(upto="2030") == pop_2030
+
+    # Projected column checkout reads only requested columns and always retains key columns
+    projected = store.play_commits(upto="2025", columns={"persons": ["age"]})
+    assert list(projected.persons.columns) == ["person_id", "age"]
+    assert list(projected.households.columns) == ["household_id"]
+
+    # Verify tree-based play_commits matches sequential operation replay across all commits (including dtypes)
+    for delta_name in store.delta_names():
+        assert store.play_commits(upto=delta_name) == replay_operations_from_genesis(store, delta_name)
 
 
 def test_reusing_deleted_key_raises_error(tmp_path):
@@ -247,6 +287,16 @@ def test_reusing_deleted_key_raises_error(tmp_path):
     )
     with pytest.raises(ValueError, match="reuse existing or previously deleted keys"):
         store.commit_current_delta()
+
+    # Uncommitted delta is skipped by default play_commits(), raises clear error if requested explicitly,
+    # blocks creating a new delta until discarded, and can be cleanly discarded to retry
+    assert store.play_commits() == store.play_commits(upto="delete_person_5")
+    with pytest.raises(ValueError, match="has not been committed"):
+        store.play_commits(upto="recycle_person_5")
+    with pytest.raises(ValueError, match="has not been committed; commit or discard it first"):
+        store.create_delta("another_delta")
+    store.discard_current_delta()
+    assert store.delta_names() == ["1_initial_commit", "2_delete_person_5"]
 
     # Also verify whole-table replacement (table_data) rejects reusing retired keys
     store_replace = PopulationStore.create(tmp_path / "population_replace", make_population())
