@@ -156,3 +156,105 @@ def test_replace_column_requires_a_value_for_each_current_row(tmp_path):
 
     with pytest.raises(ValueError, match="Replacement column 'age' has 1 values; expected 5"):
         store.apply_delta("2_invalid-age-update")
+
+
+def test_keyed_columns_and_whole_table_updates(tmp_path):
+    store = PopulationStore.create(
+        tmp_path / "population",
+        make_population(),
+        table_keys={"vehicles": ("household_id", "vehicle_id")},
+    )
+
+    # Commit 2 ("2025"): Keyed column replacement supplied in reverse person_id order + value column first
+    store.create_delta("2025")
+    reversed_ages = pd.DataFrame(
+        {
+            "age": [13, 43, 46, 19, 21],
+            "person_id": [5, 4, 3, 2, 1],
+        }
+    )
+    store.add_to_current_delta(table="persons", columns={"replace": reversed_ages})
+    store.add_to_current_delta(
+        table="persons",
+        columns={
+            "add": pd.DataFrame(
+                {
+                    "person_id": [1, 2, 3, 4, 5],
+                    "status": pd.Categorical(["ft", "pt", "ft", "ret", "dep"], categories=["ft", "pt", "ret", "dep"]),
+                }
+            )
+        },
+    )
+    store.add_to_current_delta(
+        table="persons",
+        columns={"add": pd.DataFrame({"score": pd.Series([10, pd.NA, 30, 40, 50], dtype="Int64")})},
+    )
+    # Deleting or replacing a key column via column operations is rejected
+    with pytest.raises(ValueError, match="Key column.*cannot be modified with column operations"):
+        store.add_to_current_delta(table="persons", columns={"delete": ["person_id"]})
+    with pytest.raises(ValueError, match="Key column.*cannot be modified with column operations"):
+        bad_key_series = pd.Series([10, 20, 30, 40, 50], name="person_id")
+        store.add_to_current_delta(table="persons", columns={"replace": bad_key_series})
+
+    store.add_to_current_delta(table="persons", rows={"delete": pd.DataFrame({"person_id": [3]})})
+    pop_2025 = store.commit_current_delta()
+
+    # Headless operation file (add_score_2.parquet) remains an immutable 1-column artifact on disk
+    assert list(pd.read_parquet(store.deltas_path / "2_2025/persons/add_score_2.parquet").columns) == ["score"]
+
+    # Even though ages were supplied in reverse order, keyed alignment matches each person_id accurately
+    pdt.assert_frame_equal(
+        pop_2025.persons[["person_id", "age"]],
+        pd.DataFrame({"person_id": [1, 2, 4, 5], "age": [21, 19, 43, 13]}),
+    )
+    assert isinstance(pop_2025.persons["status"].dtype, pd.CategoricalDtype)
+    assert str(pop_2025.persons["score"].dtype) == "Int64"
+
+    # Commit 3 ("2030"): Whole-table replacement for vehicles (e.g. from a fleet model)
+    store.create_delta("2030")
+    new_vehicles = pd.DataFrame(
+        {
+            "vehicle_id": [10, 1, 2],
+            "household_id": [2, 1, 2],
+            "powertrain": ["bev", "icev", "phev"],
+        }
+    )
+    store.add_to_current_delta(table="vehicles", table_data=new_vehicles)
+    pop_2030 = store.commit_current_delta()
+    pdt.assert_frame_equal(
+        pop_2030.vehicles,
+        pd.DataFrame(
+            {
+                "vehicle_id": [1, 2, 10],
+                "household_id": [1, 2, 2],
+                "powertrain": ["icev", "phev", "bev"],
+            }
+        ),
+    )
+
+
+def test_reusing_deleted_key_raises_error(tmp_path):
+    store = PopulationStore.create(tmp_path / "population", make_population())
+
+    store.create_delta("delete_person_5")
+    store.add_to_current_delta(table="persons", rows={"delete": pd.DataFrame({"person_id": [5]})})
+    store.commit_current_delta()
+
+    store.create_delta("recycle_person_5")
+    store.add_to_current_delta(
+        table="persons",
+        rows={"add": pd.DataFrame({"person_id": [5], "household_id": [1], "age": [0], "obsolete_field": [False]})},
+    )
+    with pytest.raises(ValueError, match="reuse existing or previously deleted keys"):
+        store.commit_current_delta()
+
+    # Also verify whole-table replacement (table_data) rejects reusing retired keys
+    store_replace = PopulationStore.create(tmp_path / "population_replace", make_population())
+    store_replace.create_delta("delete_person_5")
+    store_replace.add_to_current_delta(table="persons", rows={"delete": pd.DataFrame({"person_id": [5]})})
+    store_replace.commit_current_delta()
+
+    store_replace.create_delta("replace_table_with_retired_person_5")
+    store_replace.add_to_current_delta(table="persons", table_data=make_population().persons)
+    with pytest.raises(ValueError, match="Replacement table reuses previously deleted keys"):
+        store_replace.commit_current_delta()

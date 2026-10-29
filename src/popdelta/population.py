@@ -14,6 +14,9 @@ class Population:
     persons: pd.DataFrame
     vehicles: pd.DataFrame
 
+    def table(self, name: str) -> pd.DataFrame:
+        return {"households": self.households, "persons": self.persons, "vehicles": self.vehicles}[name]
+
     @classmethod
     def from_dir(cls, path: Path) -> Population:
         return cls(
