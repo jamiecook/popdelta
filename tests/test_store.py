@@ -63,12 +63,12 @@ def test_create_initializes_population_directory(tmp_path):
     # 1) applies the changes to the current state,
     # 2) persists everything to the filesystem and
     # 3) returns the new population.
-    new_pop = store.commit_current_delta()
-    assert new_pop.persons.shape[0] == 6
+    pop2 = store.commit_current_delta()
+    assert pop2.persons.shape[0] == 6
     assert store.delta_names() == ["1_initial_commit", "2_second_commit"]
-    assert Population.from_dir(population_dir / "current_state") == new_pop
+    assert Population.from_dir(population_dir / "current_state") == pop2
 
-    current_age = new_pop.persons["age"].copy()
+    current_age = pop2.persons["age"].copy()
     store.create_delta("column_manipulation")
     store.add_to_current_delta(
         table="persons",
@@ -78,12 +78,31 @@ def test_create_initializes_population_directory(tmp_path):
             "add": pd.DataFrame({"new_column": [1, 1, 1, 1, 1, 1]}),
         },
     )
-    new_new_pop = store.commit_current_delta()
-    assert new_new_pop.persons.shape[0] == 6
+    pop3 = store.commit_current_delta()
+    assert pop3.persons.shape[0] == 6
     assert "3_column_manipulation" in store.delta_names()
-    assert "new_column" in new_new_pop.persons.columns
-    assert "obsolete_field" not in new_new_pop.persons.columns
-    assert all(new_new_pop.persons["age"] == current_age + 2)
+    assert "new_column" in pop3.persons.columns
+    assert "obsolete_field" not in pop3.persons.columns
+    assert all(pop3.persons["age"] == current_age + 2)
+
+    store.create_delta("conflicting rows cols")
+    with pytest.raises(ValueError):
+        # Ordering is important and we cant' establish it with keyword args
+        # if row delete happens first, we can't add 6 age values when there are only 5 rows in the current state.
+        store.add_to_current_delta(
+            table="persons",
+            columns={"replace": current_age + 3},
+            rows={"delete": pd.DataFrame({"person_id": [6]})},
+        )
+
+    # If we sequence them correctly, we can first delete the row and then replace the column.
+    store.add_to_current_delta(table="persons", columns={"replace": current_age + 3})
+    store.add_to_current_delta(table="persons", rows={"delete": pd.DataFrame({"person_id": [6]})})
+    pop4 = store.commit_current_delta()
+
+    # Verify that the row with person_id 6 has been deleted
+    assert 6 not in pop4.persons["person_id"].values
+    assert all(pop4.persons["age"] == current_age[:-1] + 3)
 
 
 def test_delta_directories_are_sorted_by_numeric_id(tmp_path):

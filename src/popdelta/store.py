@@ -100,6 +100,8 @@ class PopulationStore:
         rows: dict[str, pd.DataFrame] | None = None,
         columns: dict[str, Any] | None = None,
     ) -> None:
+        if rows and columns:
+            raise ValueError("Rows and columns must be added to the current delta separately")
         if table not in _TABLE_NAMES:
             raise ValueError(f"Unknown population table: {table}")
         delta_names = self.delta_names()
@@ -203,9 +205,9 @@ class PopulationStore:
     @staticmethod
     def _delete_rows(frame: pd.DataFrame, path: Path) -> pd.DataFrame:
         deleted_rows = pd.read_parquet(path)
-        if set(deleted_rows.columns) != set(frame.columns):
-            raise ValueError("Deleted rows must contain every table column")
-        merged = frame.merge(deleted_rows.drop_duplicates(), how="left", indicator=True)
+        if not set(deleted_rows.columns).issubset(frame.columns):
+            raise ValueError("Deleted rows must contain columns from the table")
+        merged = frame.merge(deleted_rows.drop_duplicates(), on=list(deleted_rows.columns), how="left", indicator=True)
         return merged.loc[merged["_merge"] == "left_only", frame.columns].reset_index(drop=True)
 
     @staticmethod
