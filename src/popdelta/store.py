@@ -101,7 +101,7 @@ class PopulationStore:
         columns: dict[str, Any] | None = None,
     ) -> None:
         if rows and columns:
-            raise ValueError("Rows and columns must be added to the current delta separately")
+            raise ValueError("Rows and column operations must be added to the delta separately")
         if table not in _TABLE_NAMES:
             raise ValueError(f"Unknown population table: {table}")
         delta_names = self.delta_names()
