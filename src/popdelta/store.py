@@ -35,6 +35,10 @@ class PopulationStore:
     def deltas_path(self) -> Path:
         return self.path / "deltas"
 
+    @property
+    def store_metadata_path(self) -> Path:
+        return self.path / "store.json"
+
     @classmethod
     def create(
         cls,
@@ -52,27 +56,33 @@ class PopulationStore:
         )
         store.current_state_path.mkdir(parents=True)
         store.deltas_path.mkdir()
+        store.store_metadata_path.write_text(
+            cls._dump_json(
+                {
+                    "format": 1,
+                    "tables": {name: {"key": keys[name]} for name in _TABLE_NAMES},
+                }
+            )
+        )
         initial_delta_path = store.deltas_path / "1_initial_commit"
         initial_delta_path.mkdir()
-        state = {
-            name: {
-                "key": keys[name],
-                "index": f"1_initial_commit/{name}.parquet",
-                "columns": dict.fromkeys(population.table(name).columns, f"1_initial_commit/{name}.parquet"),
+        state: dict[str, Any] = {}
+        for name in _TABLE_NAMES:
+            rel_path = f"1_initial_commit/{name}.parquet"
+            non_key_cols = [str(c) for c in population.table(name).columns if c not in keys[name]]
+            state[name] = {
+                "index": rel_path,
+                "files": {rel_path: non_key_cols} if non_key_cols else {},
             }
-            for name in _TABLE_NAMES
-        }
         (initial_delta_path / "manifest.json").write_text(
-            json.dumps(
+            cls._dump_json(
                 {
                     "name": "Initial commit",
                     "parents": [],
                     "tables": {name: [] for name in _TABLE_NAMES},
                     "state": state,
-                },
-                indent=2,
+                }
             )
-            + "\n"
         )
         store._write_population(population)
         for name in _TABLE_NAMES:
@@ -106,25 +116,26 @@ class PopulationStore:
         deltas = self.delta_names()
         idx = deltas.index(name)
         parents = [deltas[idx - 1]] if idx > 0 else []
-        parent_state = self._load_manifest_state(parents[0] if parents else name)
+        parent_name = parents[0] if parents else None
+        parent_state = self._load_manifest_state(parent_name if parent_name is not None else name)
         population = self._read_from_state(parent_state) if parents else self.read()
         tables = {table_name: population.table(table_name).copy() for table_name in _TABLE_NAMES}
-        seen_keys = self._collect_historical_keys(deltas[:idx], parent_state, manifest["tables"])
+        keys_by_table = self._table_keys()
+        seen_keys = self._collect_historical_keys(deltas[:idx], keys_by_table, manifest["tables"])
 
         for table_name, operations in manifest["tables"].items():
             if table_name not in tables:
                 raise ValueError(f"Unknown population table: {table_name}")
-            key_cols = list(parent_state[table_name]["key"])
             tables[table_name] = self._apply_operations(
-                tables[table_name], operations, delta_path, key_cols, seen_keys.get(table_name)
+                tables[table_name], operations, delta_path, keys_by_table[table_name], seen_keys.get(table_name)
             )
 
         updated_population = Population(**tables)
         manifest["parents"] = parents
         manifest["state"] = self._build_next_state(
-            name, delta_path, parent_state, manifest["tables"], updated_population
+            name, delta_path, parent_name, parent_state, keys_by_table, manifest["tables"], updated_population
         )
-        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+        manifest_path.write_text(self._dump_json(manifest))
         self._write_population(updated_population)
 
     def delta_names(self) -> list[str]:
@@ -141,14 +152,19 @@ class PopulationStore:
             raise ValueError("Delta directory IDs must be unique")
         return [name for _, name in sorted(deltas)]
 
-    def create_delta(self, name: str) -> Path:
+    def create_delta(self, name: str, *, metadata: dict[str, Any] | None = None) -> Path:
         deltas = self.delta_names()
         if deltas and not self._has_state(deltas[-1]):
             raise ValueError(f"Delta {deltas[-1]!r} has not been committed; commit or discard it first")
+        if metadata is not None and not isinstance(metadata, dict):
+            raise TypeError("Delta metadata must be a dictionary")
         numbers = [self._delta_id(delta) for delta in deltas]
         next_id = max(numbers, default=0) + 1
         delta_path = self.deltas_path / f"{next_id}_{name}"
         delta_path.mkdir()
+        if metadata is not None:
+            manifest = {"name": delta_path.name, "metadata": metadata, "tables": {}}
+            (delta_path / "manifest.json").write_text(self._dump_json(manifest))
         return delta_path
 
     def discard_current_delta(self) -> None:
@@ -163,6 +179,8 @@ class PopulationStore:
         rows: dict[str, pd.DataFrame] | None = None,
         columns: dict[str, Any] | None = None,
         table_data: pd.DataFrame | None = None,
+        *,
+        diff_table: bool = False,
     ) -> None:
         if int(bool(rows)) + int(bool(columns)) + int(table_data is not None) > 1:
             raise ValueError("Row, column, and table replacement operations must be added to the delta separately")
@@ -173,25 +191,43 @@ class PopulationStore:
             raise ValueError("No current delta exists")
         delta_path = self.deltas_path / delta_names[-1]
         manifest_path = delta_path / "manifest.json"
-        if manifest_path.exists():
-            manifest = cast(dict[str, Any], json.loads(manifest_path.read_text()))
-        else:
-            manifest = {"name": delta_names[-1], "tables": {}}
-        tables = cast(dict[str, list[dict[str, Any]]], manifest.setdefault("tables", {}))
-        operations = tables.setdefault(table, [])
-        key_cols = self._table_keys_for_latest(delta_names, table)
+        manifest = (
+            cast(dict[str, Any], json.loads(manifest_path.read_text()))
+            if manifest_path.exists()
+            else {"name": delta_names[-1], "tables": {}}
+        )
+        operations = cast(dict[str, list[dict[str, Any]]], manifest.setdefault("tables", {})).setdefault(table, [])
+        key_cols = self._table_keys()[table]
         if table_data is not None:
-            if not isinstance(table_data, pd.DataFrame):
-                raise TypeError("Replacement table must be a pandas DataFrame")
-            normalized = self._normalize_keyed(table_data, key_cols)
-            file_name = f"{table}/replace_table_{len(operations)}.parquet"
-            (delta_path / table).mkdir(parents=True, exist_ok=True)
-            normalized.to_parquet(delta_path / file_name, index=False)
-            operations.append({"replace_table": file_name})
+            self._add_table_replacement(table, delta_path, operations, table_data, key_cols, diff_table=diff_table)
         else:
             self._add_row_operations(table, delta_path, operations, rows or {})
             self._add_column_operations(table, delta_path, operations, columns or {}, key_cols)
-        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+        manifest_path.write_text(self._dump_json(manifest))
+
+    @staticmethod
+    def _add_table_replacement(
+        table: str,
+        delta_path: Path,
+        operations: list[dict[str, Any]],
+        table_data: pd.DataFrame,
+        key_cols: list[str],
+        *,
+        diff_table: bool = False,
+    ) -> None:
+        if not isinstance(table_data, pd.DataFrame):
+            raise TypeError("Replacement table must be a pandas DataFrame")
+        if diff_table:
+            # TODO: Decompose `table_data` against the current committed table by `key_cols` into explicit
+            # `delete_rows` (retired keys), `add_rows` (new keys), `add_columns` (new columns), and
+            # `replace_columns` (shared columns whose values changed), preserving unmodeled columns and
+            # avoiding opaque whole-table replacements when a model step writes a full table snapshot.
+            raise NotImplementedError("Automatic table diffing (diff_table=True) is not yet implemented")
+        normalized = PopulationStore._normalize_keyed(table_data, key_cols)
+        file_name = f"{table}/replace_table_{len(operations)}.parquet"
+        (delta_path / table).mkdir(parents=True, exist_ok=True)
+        normalized.to_parquet(delta_path / file_name, index=False)
+        operations.append({"replace_table": file_name})
 
     @staticmethod
     def _add_row_operations(
@@ -225,26 +261,33 @@ class PopulationStore:
                 continue
             if action == "replace":
                 if isinstance(values, pd.Series):
-                    column, frame = str(values.name), values.to_frame()
+                    val_cols, frame = [str(values.name)], values.to_frame()
                 elif isinstance(values, pd.DataFrame):
-                    column, frame = PopulationStore._extract_column_frame(values, key_cols)
+                    val_cols, frame = PopulationStore._extract_column_frame(values, key_cols)
                 else:
                     raise TypeError("Replacement column must be a pandas Series or DataFrame")
-                operation_value: Any = {column: f"{table}/replace_{column}_{len(operations)}.parquet"}
                 operation = "replace_columns"
-                file_name = operation_value[column]
             elif action == "add":
                 if not isinstance(values, pd.DataFrame):
-                    raise TypeError("Added columns must be a one-column or keyed pandas DataFrame")
-                column, frame = PopulationStore._extract_column_frame(values, key_cols)
-                operation, file_name = "add_columns", f"{table}/add_{column}_{len(operations)}.parquet"
-                operation_value = file_name
+                    raise TypeError("Added columns must be a pandas DataFrame")
+                val_cols, frame = PopulationStore._extract_column_frame(values, key_cols)
+                operation = "add_columns"
             else:
                 raise ValueError(f"Unsupported column action: {action}")
-            PopulationStore._reject_key_columns([column], key_cols)
+            PopulationStore._reject_key_columns(val_cols, key_cols)
+            file_name, operation_value = PopulationStore._column_op_entry(table, action, val_cols, len(operations))
             (delta_path / table).mkdir(parents=True, exist_ok=True)
             frame.to_parquet(delta_path / file_name, index=False)
             operations.append({operation: operation_value})
+
+    @staticmethod
+    def _column_op_entry(table: str, action: str, val_cols: list[str], op_idx: int) -> tuple[str, Any]:
+        if len(val_cols) == 1:
+            col = val_cols[0]
+            file_name = f"{table}/{action}_{col}_{op_idx}.parquet"
+            return file_name, ({col: file_name} if action == "replace" else file_name)
+        file_name = f"{table}/{action}_{op_idx}.parquet"
+        return file_name, {"file": file_name, "columns": val_cols}
 
     @staticmethod
     def _reject_key_columns(cols: list[str], key_cols: list[str] | None) -> None:
@@ -252,13 +295,16 @@ class PopulationStore:
             raise ValueError(f"Key column(s) {sorted(hit)} cannot be modified with column operations; use table_data")
 
     @staticmethod
-    def _extract_column_frame(values: pd.DataFrame, key_cols: list[str] | None) -> tuple[str, pd.DataFrame]:
-        if len(values.columns) == 1:
-            return str(values.columns[0]), values
-        if key_cols and set(key_cols).issubset(values.columns) and len(values.columns) == len(key_cols) + 1:
-            col = next(str(c) for c in values.columns if c not in key_cols)
-            return col, PopulationStore._normalize_keyed(values[[*key_cols, col]], key_cols)
-        raise ValueError(f"Column DataFrame must contain 1 value column or key {key_cols} plus 1 value column")
+    def _extract_column_frame(values: pd.DataFrame, key_cols: list[str] | None) -> tuple[list[str], pd.DataFrame]:
+        if values.columns.empty:
+            raise ValueError("Column DataFrame must contain at least one value column")
+        if key_cols and set(key_cols).issubset(values.columns) and len(values.columns) > len(key_cols):
+            val_cols = [str(c) for c in values.columns if c not in key_cols]
+            PopulationStore._reject_key_columns(val_cols, key_cols)
+            return val_cols, PopulationStore._normalize_keyed(values[[*key_cols, *val_cols]], key_cols)
+        val_cols = [str(c) for c in values.columns]
+        PopulationStore._reject_key_columns(val_cols, key_cols)
+        return val_cols, values
 
     def commit_current_delta(self) -> Population:
         delta_names = self.delta_names()
@@ -270,6 +316,16 @@ class PopulationStore:
     def apply_deltas(self) -> None:
         for name in self.delta_names():
             self.apply_delta(name)
+
+    @staticmethod
+    def _iter_column_op_files(action: str, value: Any) -> list[tuple[list[str] | None, str]]:
+        if isinstance(value, dict) and isinstance(value.get("file"), str) and isinstance(value.get("columns"), list):
+            return [([str(c) for c in value["columns"]], value["file"])]
+        if action == "replace_columns" and isinstance(value, dict):
+            return [([str(col)], str(file_name)) for col, file_name in value.items()]
+        if action == "add_columns" and isinstance(value, str):
+            return [(None, value)]
+        raise ValueError(f"Invalid {action} specification: {value!r}")
 
     @staticmethod
     def _apply_operations(
@@ -289,10 +345,15 @@ class PopulationStore:
                 frame = PopulationStore._add_rows(frame, delta_path / value, key_cols, seen_keys)
             elif action == "delete_rows":
                 frame = PopulationStore._delete_rows(frame, delta_path / value, key_cols)
-            elif action == "replace_columns":
-                frame = PopulationStore._replace_columns(frame, value, delta_path, key_cols)
-            elif action == "add_columns":
-                frame = PopulationStore._apply_column_file(frame, delta_path / value, key_cols, expected_col=None)
+            elif action in {"replace_columns", "add_columns"}:
+                for expected_cols, file_name in PopulationStore._iter_column_op_files(action, value):
+                    frame = PopulationStore._apply_column_file(
+                        frame,
+                        delta_path / file_name,
+                        key_cols,
+                        expected_cols=expected_cols,
+                        is_replace=(action == "replace_columns"),
+                    )
             elif action == "delete_columns":
                 PopulationStore._reject_key_columns(value, key_cols)
                 frame = frame.drop(columns=value)
@@ -341,66 +402,72 @@ class PopulationStore:
         return PopulationStore._normalize_keyed(result, key_cols) if key_cols else result
 
     @staticmethod
-    def _replace_columns(
-        frame: pd.DataFrame, replacements: dict[str, str], delta_path: Path, key_cols: list[str] | None = None
-    ) -> pd.DataFrame:
-        for column, file_name in replacements.items():
-            frame = PopulationStore._apply_column_file(frame, delta_path / file_name, key_cols, expected_col=column)
-        return frame
-
-    @staticmethod
     def _apply_column_file(
         frame: pd.DataFrame,
         path: Path,
         key_cols: list[str] | None,
         *,
-        expected_col: str | None,
+        expected_cols: list[str] | None,
+        is_replace: bool,
     ) -> pd.DataFrame:
         col_df = pd.read_parquet(path)
-        if key_cols is not None and set(key_cols).issubset(col_df.columns) and len(col_df.columns) == len(key_cols) + 1:
-            column = next(c for c in col_df.columns if c not in key_cols)
-            if expected_col is not None and column != expected_col:
-                raise ValueError(f"Replacement file for {expected_col!r} must contain only that column")
-            if len(col_df) != len(frame):
-                raise ValueError(f"Column {column!r} has {len(col_df)} values; expected {len(frame)}")
-            normalized_col = PopulationStore._normalize_keyed(col_df[[*key_cols, column]], key_cols)
+        is_keyed = bool(key_cols and set(key_cols).issubset(col_df.columns) and len(col_df.columns) > len(key_cols))
+        val_cols = [str(c) for c in col_df.columns if not (is_keyed and key_cols and c in key_cols)]
+        cols_ref = expected_cols or val_cols
+        label: Any = cols_ref[0] if len(cols_ref) == 1 else cols_ref
+        if expected_cols is not None and val_cols != expected_cols:
+            raise ValueError(f"Replacement file for {label!r} must contain only that column")
+        PopulationStore._reject_key_columns(val_cols, key_cols)
+        if len(col_df) != len(frame) or not val_cols:
+            if is_replace or is_keyed:
+                prefix = "Column" if is_keyed else "Replacement column"
+                raise ValueError(f"{prefix} {label!r} has {len(col_df)} values; expected {len(frame)}")
+            raise ValueError("Added column must contain exactly one value for each current row")
+        if is_keyed and key_cols is not None:
+            normalized_col = PopulationStore._normalize_keyed(col_df[[*key_cols, *val_cols]], key_cols)
             merged = frame[key_cols].merge(normalized_col, on=key_cols, how="left", indicator=True)
             if (merged["_merge"] != "both").any():
-                raise ValueError(f"Column {column!r} keys do not match current table keys")
-            frame[column] = merged[column].array
+                raise ValueError(f"Column {label!r} keys do not match current table keys")
+            source_df = merged
         else:
-            if expected_col is not None and list(col_df.columns) != [expected_col]:
-                raise ValueError(f"Replacement file for {expected_col!r} must contain only that column")
-            if len(col_df) != len(frame) or len(col_df.columns) != 1:
-                if expected_col is not None:
-                    raise ValueError(
-                        f"Replacement column {expected_col!r} has {len(col_df)} values; expected {len(frame)}"
-                    )
-                raise ValueError("Added column must contain exactly one value for each current row")
-            column = str(col_df.columns[0])
-            PopulationStore._reject_key_columns([column], key_cols)
-            frame[column] = col_df[column].array
+            source_df = col_df
+        for col in val_cols:
+            if col in frame.columns:
+                frame = frame.drop(columns=[col])
+            frame[col] = source_df[col].array
         return frame
 
-    @staticmethod
     def _build_next_state(
+        self,
         delta_name: str,
         delta_path: Path,
+        parent_name: str | None,
         parent_state: dict[str, Any],
+        keys_by_table: dict[str, list[str]],
         operations_by_table: dict[str, list[dict[str, Any]]],
         updated_population: Population,
     ) -> dict[str, Any]:
-        next_state = copy.deepcopy(parent_state)
-        for table_name, operations in operations_by_table.items():
+        next_state: dict[str, Any] = {}
+        for table_name in _TABLE_NAMES:
+            operations = operations_by_table.get(table_name, [])
             if not operations:
+                if parent_name is None:
+                    next_state[table_name] = copy.deepcopy(parent_state[table_name])
+                else:
+                    parent_entry = parent_state[table_name]
+                    next_state[table_name] = parent_entry if isinstance(parent_entry, str) else parent_name
                 continue
-            table_state = next_state[table_name]
-            key_cols = list(table_state["key"])
+
+            table_state = copy.deepcopy(self._resolve_table_state(parent_state, table_name))
+            key_cols = keys_by_table[table_name]
             updated_frame = updated_population.table(table_name)
+            non_key_cols = [str(c) for c in updated_frame.columns if c not in key_cols]
             if len(operations) == 1 and "replace_table" in operations[0]:
                 rel_state = f"{delta_name}/{operations[0]['replace_table']}"
-                table_state["index"] = rel_state
-                table_state["columns"] = dict.fromkeys(updated_frame.columns, rel_state)
+                next_state[table_name] = {
+                    "index": rel_state,
+                    "files": {rel_state: non_key_cols} if non_key_cols else {},
+                }
                 continue
 
             op_kinds = {next(iter(op)) for op in operations}
@@ -409,24 +476,42 @@ class PopulationStore:
                 (delta_path / table_name).mkdir(parents=True, exist_ok=True)
                 updated_frame.to_parquet(delta_path / state_file, index=False)
                 rel_state = f"{delta_name}/{state_file}"
-                table_state["index"] = rel_state
-                table_state["columns"] = dict.fromkeys(updated_frame.columns, rel_state)
+                next_state[table_name] = {
+                    "index": rel_state,
+                    "files": {rel_state: non_key_cols} if non_key_cols else {},
+                }
                 continue
 
             if "delete_rows" in op_kinds:
                 index_file = f"{table_name}/index.parquet"
                 (delta_path / table_name).mkdir(parents=True, exist_ok=True)
                 updated_frame[key_cols].to_parquet(delta_path / index_file, index=False)
-                rel_index = f"{delta_name}/{index_file}"
-                table_state["index"] = rel_index
-                for k_col in key_cols:
-                    table_state["columns"][k_col] = rel_index
+                table_state["index"] = f"{delta_name}/{index_file}"
 
-            PopulationStore._update_column_pointers(
+            self._update_column_pointers(
                 delta_name, delta_path, table_name, operations, table_state, key_cols, updated_frame
             )
+            next_state[table_name] = table_state
 
         return next_state
+
+    @staticmethod
+    def _remove_columns_from_files(files: dict[str, list[str]], cols: list[str]) -> None:
+        drop = set(cols)
+        for file_path in list(files):
+            remaining = [c for c in files[file_path] if c not in drop]
+            if remaining:
+                files[file_path] = remaining
+            else:
+                del files[file_path]
+
+    @staticmethod
+    def _assign_columns_to_file(files: dict[str, list[str]], rel_path: str, cols: list[str]) -> None:
+        PopulationStore._remove_columns_from_files(files, cols)
+        bucket = files.setdefault(rel_path, [])
+        for col in cols:
+            if col not in bucket:
+                bucket.append(col)
 
     @staticmethod
     def _update_column_pointers(
@@ -438,25 +523,29 @@ class PopulationStore:
         key_cols: list[str],
         updated_frame: pd.DataFrame,
     ) -> None:
-        for op in operations:
+        files: dict[str, list[str]] = table_state["files"]
+        for op_idx, op in enumerate(operations):
             action, value = next(iter(op.items()))
             if action == "delete_columns":
-                for col in value:
-                    table_state["columns"].pop(col, None)
+                PopulationStore._remove_columns_from_files(files, list(value))
                 continue
             if action not in {"replace_columns", "add_columns"}:
                 continue
-            items = value.items() if action == "replace_columns" else [(None, value)]
-            for col_hint, rel_op_path in items:
+            for expected_cols, rel_op_path in PopulationStore._iter_column_op_files(action, value):
                 op_df = pd.read_parquet(delta_path / rel_op_path)
-                col = col_hint or next(str(c) for c in op_df.columns if c not in key_cols)
-                if set(key_cols).issubset(op_df.columns) and len(op_df.columns) == len(key_cols) + 1:
-                    table_state["columns"][col] = f"{delta_name}/{rel_op_path}"
+                is_keyed = set(key_cols).issubset(op_df.columns) and len(op_df.columns) > len(key_cols)
+                cols = expected_cols or [str(c) for c in op_df.columns if c not in key_cols]
+                if is_keyed:
+                    target_rel = f"{delta_name}/{rel_op_path}"
                 else:
-                    state_col_rel = f"{table_name}/col_{col}.parquet"
+                    suffix = cols[0] if len(cols) == 1 else str(op_idx)
+                    state_col_rel = f"{table_name}/col_{suffix}.parquet"
                     (delta_path / table_name).mkdir(parents=True, exist_ok=True)
-                    updated_frame[[*key_cols, col]].to_parquet(delta_path / state_col_rel, index=False)
-                    table_state["columns"][col] = f"{delta_name}/{state_col_rel}"
+                    live_cols = [c for c in cols if c in updated_frame.columns]
+                    if live_cols:
+                        updated_frame[[*key_cols, *live_cols]].to_parquet(delta_path / state_col_rel, index=False)
+                    target_rel = f"{delta_name}/{state_col_rel}"
+                PopulationStore._assign_columns_to_file(files, target_rel, cols)
 
     def _read_from_state(
         self,
@@ -467,24 +556,26 @@ class PopulationStore:
         if columns is not None and (unknown := set(columns) - set(_TABLE_NAMES)):
             raise ValueError(f"Unknown population table(s): {sorted(unknown)}")
 
+        keys_by_table = self._table_keys()
         tables: dict[str, pd.DataFrame] = {}
         for table_name in _TABLE_NAMES:
-            table_state = state[table_name]
-            key_cols: list[str] = list(table_state["key"])
-            col_map: dict[str, str] = table_state["columns"]
-            req_cols = list(columns[table_name]) if columns and table_name in columns else list(col_map.keys())
-            if missing := [col for col in req_cols if col not in col_map]:
+            table_state = self._resolve_table_state(state, table_name)
+            key_cols = keys_by_table[table_name]
+            files_map: dict[str, list[str]] = table_state["files"]
+            non_key_cols = [col for file_cols in files_map.values() for col in file_cols]
+            available_cols = [*key_cols, *non_key_cols]
+            req_cols = list(columns[table_name]) if columns and table_name in columns else available_cols
+            if missing := [col for col in req_cols if col not in available_cols]:
                 raise ValueError(f"Unknown column(s) {missing} for table {table_name!r}")
             target_cols = [*(k for k in key_cols if k not in req_cols), *req_cols]
+            wanted_non_key = set(target_cols) - set(key_cols)
 
             base_df = pd.read_parquet(self.deltas_path / table_state["index"], columns=key_cols).copy()
-            cols_by_source: dict[str, list[str]] = {}
-            for col in target_cols:
-                if col not in key_cols:
-                    cols_by_source.setdefault(col_map[col], []).append(col)
-
-            for rel_source, source_cols in cols_by_source.items():
-                piece = pd.read_parquet(self.deltas_path / rel_source, columns=[*key_cols, *source_cols])
+            for rel_source, source_cols in files_map.items():
+                needed = [col for col in source_cols if col in wanted_non_key]
+                if not needed:
+                    continue
+                piece = pd.read_parquet(self.deltas_path / rel_source, columns=[*key_cols, *needed])
                 base_df = base_df.merge(piece, on=key_cols, how="left", validate="one_to_one")
 
             tables[table_name] = base_df[target_cols].reset_index(drop=True)
@@ -494,27 +585,42 @@ class PopulationStore:
     def _collect_historical_keys(
         self,
         prior_deltas: list[str],
-        fallback_state: dict[str, Any],
+        keys_by_table: dict[str, list[str]],
         operations_by_table: dict[str, list[dict[str, Any]]],
     ) -> dict[str, pd.DataFrame]:
         seen: dict[str, pd.DataFrame] = {}
         for name, ops in operations_by_table.items():
             if not any("add_rows" in op or "replace_table" in op for op in ops):
                 continue
-            key_cols = list(fallback_state[name]["key"])
-            index_paths = dict.fromkeys(self._load_manifest_state(d)[name]["index"] for d in prior_deltas)
+            key_cols = keys_by_table[name]
+            index_paths = dict.fromkeys(
+                self._resolve_table_state(self._load_manifest_state(d), name)["index"] for d in prior_deltas
+            )
             frames = [pd.read_parquet(self.deltas_path / rel, columns=key_cols) for rel in index_paths]
             seen[name] = (
                 pd.concat(frames, ignore_index=True).drop_duplicates() if frames else pd.DataFrame(columns=key_cols)
             )
         return seen
 
-    def _table_keys_for_latest(self, delta_names: list[str], table: str) -> list[str]:
-        for delta in reversed(delta_names):
-            manifest_path = self.deltas_path / delta / "manifest.json"
-            if manifest_path.exists() and "state" in (data := json.loads(manifest_path.read_text())):
-                return list(data["state"][table]["key"])
-        return list(_DEFAULT_TABLE_KEYS[table])
+    def _table_keys(self) -> dict[str, list[str]]:
+        if self.store_metadata_path.exists():
+            meta = cast(dict[str, Any], json.loads(self.store_metadata_path.read_text()))
+            return {name: list(meta["tables"][name]["key"]) for name in _TABLE_NAMES}
+        return {name: list(cols) for name, cols in _DEFAULT_TABLE_KEYS.items()}
+
+    def _resolve_table_state(self, state: dict[str, Any], table_name: str) -> dict[str, Any]:
+        entry = state[table_name]
+        if isinstance(entry, str):
+            target_state = self._load_manifest_state(entry)
+            resolved = target_state.get(table_name)
+            if not isinstance(resolved, dict):
+                raise ValueError(
+                    f"State pointer for {table_name!r} in {entry!r} must resolve to a state block in one hop"
+                )
+            return resolved
+        if isinstance(entry, dict):
+            return entry
+        raise ValueError(f"Invalid state entry for table {table_name!r}: {entry!r}")
 
     def _has_state(self, delta_name: str) -> bool:
         manifest_path = self.deltas_path / delta_name / "manifest.json"
@@ -556,7 +662,18 @@ class PopulationStore:
             raise ValueError(f"Missing key column(s): {missing}")
         if frame[key_cols].isna().any().any() or frame.duplicated(subset=key_cols).any():
             raise ValueError(f"Duplicate or null key values in {key_cols}")
-        return frame.sort_values(key_cols, kind="mergesort").reset_index(drop=True)
+        ordered_cols = [*key_cols, *(c for c in frame.columns if c not in key_cols)]
+        return frame[ordered_cols].sort_values(key_cols, kind="mergesort").reset_index(drop=True)
+
+    @staticmethod
+    def _dump_json(data: dict[str, Any]) -> str:
+        raw = json.dumps(data, indent=2)
+        compact = re.sub(
+            r"\[(?:\s*\"(?:[^\"\\]|\\.)*\"\s*,?)*\s*\]",
+            lambda m: json.dumps(json.loads(m.group(0))),
+            raw,
+        )
+        return compact + "\n"
 
     def _write_population(self, population: Population) -> None:
         for name in _TABLE_NAMES:

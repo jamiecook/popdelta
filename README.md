@@ -94,6 +94,7 @@ deltas:
 
 ```text
 population/
+├── store.json
 ├── current_state/
 │   ├── households.parquet
 │   ├── persons.parquet
@@ -116,11 +117,13 @@ population/
             └── replace_age_0.parquet
 ```
 
+`store.json` is written once at store creation and records the primary key column(s) of each table.
 Each delta has a JSON manifest. The `tables` operation list records what changed and preserves order,
 so a replacement column can cover rows created by an earlier `add_rows` operation. The `state` block
-records the result: for each table, the file holding its current keys (`index`) and the file that
-last wrote each active column. Tables and columns the delta did not touch keep pointing at earlier
-deltas, so nothing is copied:
+records the resulting table state: for each table modified by the delta, `index` names the file
+holding its current primary keys and `files` maps each Parquet file to the active non-key columns it
+owns. Tables the delta did not touch are recorded as a single string naming the delta that last
+modified them, so resolving any table requires at most one extra manifest read and nothing is copied:
 
 ```json
 {
@@ -134,43 +137,32 @@ deltas, so nothing is copied:
     ]
   },
   "state": {
-    "households": {
-      "key": ["household_id"],
-      "index": "1_initial_commit/households.parquet",
-      "columns": {"household_id": "1_initial_commit/households.parquet"}
-    },
+    "households": "1_initial_commit",
     "persons": {
-      "key": ["person_id"],
       "index": "2_second_commit/persons/state.parquet",
-      "columns": {
-        "person_id": "2_second_commit/persons/state.parquet",
-        "household_id": "2_second_commit/persons/state.parquet",
-        "age": "3_column_manipulation/persons/replace_age_0.parquet",
-        "new_column": "3_column_manipulation/persons/add_new_column_2.parquet"
+      "files": {
+        "2_second_commit/persons/state.parquet": ["household_id"],
+        "3_column_manipulation/persons/replace_age_0.parquet": ["age"],
+        "3_column_manipulation/persons/add_new_column_2.parquet": ["new_column"]
       }
     },
-    "vehicles": {
-      "key": ["vehicle_id"],
-      "index": "1_initial_commit/vehicles.parquet",
-      "columns": {
-        "vehicle_id": "1_initial_commit/vehicles.parquet",
-        "household_id": "1_initial_commit/vehicles.parquet"
-      }
-    }
+    "vehicles": "1_initial_commit"
   }
 }
 ```
 
 `add_rows` and `delete_rows` refer to Parquet tables. Deleting rows writes only a new key index, and
-existing column files stay valid. A column file contains the table's key columns plus one named
-column, and it is matched to rows by key rather than by position. A plain Series is still accepted
-and is assigned in key order. Tables are always stored and returned sorted by key. Keys must be
-unique and non-null, and a key that has been deleted cannot be reused by a later delta.
+existing column files stay valid. A column file contains the table's key columns plus one or more
+named columns (a multi-column DataFrame writes a single column-set file), and it is matched to rows
+by key rather than by position. A plain Series is still accepted and is assigned in key order.
+Tables are always stored and returned sorted by key. Keys must be unique and non-null, and a key
+that has been deleted cannot be reused by a later delta.
 
-Models that write complete tables can commit them directly instead of computing a diff:
+Models that write complete tables can commit them directly instead of computing a diff, and
+`create_delta(..., metadata=...)` can record optional model or run provenance in the manifest:
 
 ```python
-store.create_delta("2025_fleet")
+store.create_delta("2025_fleet", metadata={"model": "atlas"})
 store.add_to_current_delta(table="vehicles", table_data=new_vehicles)
 store.commit_current_delta()
 ```
