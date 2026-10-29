@@ -40,7 +40,52 @@ population = Population(
 
 ## On-disk layout
 
-`PopulationStore` keeps the materialized state and its visible delta history together:
+`PopulationStore` keeps the materialized state and its visible delta history together. A complete
+example starts with two households, adds one person, then changes columns in a second delta:
+
+```python
+from pathlib import Path
+
+import pandas as pd
+
+from popdelta import Population, PopulationStore
+
+population = Population(
+    households=pd.DataFrame({"household_id": [1, 2]}),
+    persons=pd.DataFrame(
+        {
+            "person_id": [1, 2, 3, 4, 5],
+            "household_id": [1, 1, 2, 2, 2],
+            "age": [20, 18, 45, 42, 12],
+            "obsolete_field": [True, True, False, False, False],
+        }
+    ),
+    vehicles=pd.DataFrame({"vehicle_id": [1, 2], "household_id": [1, 2]}),
+)
+
+store = PopulationStore.create(Path("population"), population)
+store.create_delta("second_commit")
+store.add_to_current_delta(
+    table="persons",
+    rows={"add": pd.DataFrame({"person_id": [6], "household_id": [2], "age": [0], "obsolete_field": [False]})},
+)
+pop2 = store.commit_current_delta()
+
+current_age = pop2.persons["age"].copy()
+store.create_delta("column_manipulation")
+store.add_to_current_delta(
+    table="persons",
+    columns={
+        "replace": current_age + 2,
+        "delete": ["obsolete_field"],
+        "add": pd.DataFrame({"new_column": [1, 1, 1, 1, 1, 1]}),
+    },
+)
+pop3 = store.commit_current_delta()
+```
+
+After this code runs, the directory contains the materialized latest state and both committed
+deltas:
 
 ```text
 population/
@@ -49,16 +94,24 @@ population/
 │   ├── persons.parquet
 │   └── vehicles.parquet
 └── deltas/
-    ├── 1_initial-population/
-    └── 2_evolve-to-2030/
+    ├── 1_initial_commit/
+    │   ├── households.parquet
+    │   ├── manifest.json
+    │   ├── persons.parquet
+    │   └── vehicles.parquet
+    ├── 2_second_commit/
+    │   ├── manifest.json
+    │   └── persons/
+    │       └── add_rows_0.parquet
+    └── 3_column_manipulation/
         ├── manifest.json
         └── persons/
-            ├── added_rows.parquet
-            └── replacement_age.parquet
+            ├── add_new_column_1.parquet
+            └── replace_age_0.parquet
 ```
 
-The manifest uses a list so operations run in order. This matters when an operation changes the
-number of rows before a later replacement column is applied:
+Each delta has a JSON manifest. The table operation list preserves order, so a replacement column
+can contain exactly one value for each row created by an earlier `add_rows` operation:
 
 ```json
 {
@@ -66,7 +119,7 @@ number of rows before a later replacement column is applied:
   "date_generated": "2026-10-12T09:00:00",
   "tables": {
     "persons": [
-      {"add_rows": "persons/added_rows.parquet"},
+      {"add_rows": "persons/add_rows_0.parquet"},
       {"delete_rows": "persons/deleted_rows.parquet"},
       {"replace_columns": {"age": "persons/replacement_age.parquet"}},
       {"delete_columns": ["obsolete_field"]}
