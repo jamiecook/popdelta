@@ -87,6 +87,11 @@ class PopulationStore:
             raise ValueError("Delta directory IDs must be unique")
         return [name for _, name in sorted(deltas)]
 
+    def create_delta(self, name: str) -> Path:
+        delta_path = self.deltas_path / f"{len(self.delta_names()) + 1}_{name}"
+        delta_path.mkdir()
+        return delta_path
+
     def apply_deltas(self) -> None:
         for name in self.delta_names():
             self.apply_delta(name)

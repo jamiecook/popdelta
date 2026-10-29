@@ -46,6 +46,11 @@ def test_create_initializes_population_directory(tmp_path):
     assert store.delta_names() == ["1_initial_commit"]
     assert Population.from_dir(population_dir / "deltas" / "1_initial_commit") == population
 
+    store.create_delta("second_commit")
+    assert store.delta_names() == ["1_initial_commit", "2_second_commit"]
+    assert (population_dir / "deltas" / "2_second_commit").exists()
+    assert len(list((population_dir / "deltas" / "2_second_commit").iterdir())) == 0
+
 
 def test_delta_directories_are_sorted_by_numeric_id(tmp_path):
     store = PopulationStore.create(tmp_path / "population", make_population())
