@@ -115,10 +115,9 @@ class PopulationStore:
             return
         deltas = self.delta_names()
         idx = deltas.index(name)
-        parents = [deltas[idx - 1]] if idx > 0 else []
-        parent_name = parents[0] if parents else None
-        parent_state = self._load_manifest_state(parent_name if parent_name is not None else name)
-        population = self._read_from_state(parent_state) if parents else self.read()
+        parent_name = deltas[idx - 1]
+        parent_state = self._load_manifest_state(parent_name)
+        population = self._read_from_state(parent_state)
         tables = {table_name: population.table(table_name).copy() for table_name in _TABLE_NAMES}
         keys_by_table = self._table_keys()
         seen_keys = self._collect_historical_keys(deltas[:idx], keys_by_table, manifest["tables"])
@@ -131,7 +130,7 @@ class PopulationStore:
             )
 
         updated_population = Population(**tables)
-        manifest["parents"] = parents
+        manifest["parents"] = [parent_name]
         manifest["state"] = self._build_next_state(
             name, delta_path, parent_name, parent_state, keys_by_table, manifest["tables"], updated_population
         )
@@ -214,26 +213,17 @@ class PopulationStore:
         key_cols: list[str],
     ) -> list[str]:
         committed = [d for d in self.delta_names() if self._has_state(d)]
-        if committed:
-            table_state = self._resolve_table_state(self._load_manifest_state(committed[-1]), table)
-            active = [col for file_cols in table_state["files"].values() for col in file_cols]
-        else:
-            current_cols = pd.read_parquet(self.current_state_path / f"{table}.parquet").columns
-            active = [str(c) for c in current_cols if c not in key_cols]
+        table_state = self._resolve_table_state(self._load_manifest_state(committed[-1]), table)
+        active = [col for file_cols in table_state["files"].values() for col in file_cols]
         for op in operations:
             action, val = next(iter(op.items()))
             if action == "replace_table":
-                op_cols = pd.read_parquet(delta_path / val).columns
-                active = [str(c) for c in op_cols if c not in key_cols]
+                active = [str(c) for c in pd.read_parquet(delta_path / val).columns if c not in key_cols]
             elif action == "delete_columns":
-                drop = set(val)
-                active = [c for c in active if c not in drop]
+                active = [c for c in active if c not in val]
             elif action in {"replace_columns", "add_columns"}:
-                for expected_cols, rel_path in self._iter_column_op_files(action, val):
-                    cols = expected_cols or [
-                        str(c) for c in pd.read_parquet(delta_path / rel_path).columns if c not in key_cols
-                    ]
-                    active = [*(c for c in active if c not in cols), *cols]
+                cols = val["columns"]
+                active = [*(c for c in active if c not in cols), *cols]
         return active
 
     @staticmethod
@@ -274,31 +264,31 @@ class PopulationStore:
         delta_path: Path,
         operations: list[dict[str, Any]],
         columns: dict[str, Any],
-        key_cols: list[str] | None = None,
-        active_cols: list[str] | None = None,
+        key_cols: list[str],
+        active_cols: list[str],
     ) -> None:
         for action, values in columns.items():
             if action == "delete":
                 if not isinstance(values, list):
                     raise TypeError("Deleted columns must be a list")
                 PopulationStore._reject_key_columns(values, key_cols)
-                if active_cols is not None:
-                    active_cols[:] = [c for c in active_cols if c not in values]
+                active_cols[:] = [c for c in active_cols if c not in values]
                 operations.append({"delete_columns": values})
                 continue
             val_cols, frame = PopulationStore._prepare_column_input(action, values, key_cols, active_cols)
             operation = "replace_columns" if action == "replace" else "add_columns"
-            file_name, operation_value = PopulationStore._column_op_entry(table, action, val_cols, len(operations))
+            stem = f"{action}_{val_cols[0]}" if len(val_cols) == 1 else action
+            file_name = f"{table}/{stem}_{len(operations)}.parquet"
             (delta_path / table).mkdir(parents=True, exist_ok=True)
             frame.to_parquet(delta_path / file_name, index=False)
-            operations.append({operation: operation_value})
+            operations.append({operation: {"file": file_name, "columns": val_cols}})
 
     @staticmethod
     def _prepare_column_input(
         action: str,
         values: Any,
-        key_cols: list[str] | None,
-        active_cols: list[str] | None,
+        key_cols: list[str],
+        active_cols: list[str],
     ) -> tuple[list[str], pd.DataFrame]:
         if action == "replace":
             if isinstance(values, pd.Series):
@@ -314,10 +304,9 @@ class PopulationStore:
         else:
             raise ValueError(f"Unsupported column action: {action}")
         PopulationStore._reject_key_columns(val_cols, key_cols)
-        if active_cols is not None:
-            PopulationStore._validate_column_op(val_cols, active_cols, is_replace=(action == "replace"))
-            if action == "add":
-                active_cols.extend(val_cols)
+        PopulationStore._validate_column_op(val_cols, active_cols, is_replace=(action == "replace"))
+        if action == "add":
+            active_cols.extend(val_cols)
         return val_cols, frame
 
     @staticmethod
@@ -329,24 +318,14 @@ class PopulationStore:
             raise ValueError(f"Cannot add existing column(s) {existing}")
 
     @staticmethod
-    def _column_op_entry(table: str, action: str, val_cols: list[str], op_idx: int) -> tuple[str, dict[str, Any]]:
-        if len(val_cols) == 1:
-            file_name = f"{table}/{action}_{val_cols[0]}_{op_idx}.parquet"
-        else:
-            file_name = f"{table}/{action}_{op_idx}.parquet"
-        return file_name, {"file": file_name, "columns": val_cols}
-
-    @staticmethod
-    def _reject_key_columns(cols: list[str], key_cols: list[str] | None) -> None:
-        if key_cols and (hit := set(cols) & set(key_cols)):
+    def _reject_key_columns(cols: list[str], key_cols: list[str]) -> None:
+        if hit := set(cols) & set(key_cols):
             raise ValueError(f"Key column(s) {sorted(hit)} cannot be modified with column operations; use table_data")
 
     @staticmethod
-    def _extract_column_frame(values: pd.DataFrame, key_cols: list[str] | None) -> tuple[list[str], pd.DataFrame]:
+    def _extract_column_frame(values: pd.DataFrame, key_cols: list[str]) -> tuple[list[str], pd.DataFrame]:
         if values.columns.empty:
             raise ValueError("Column DataFrame must contain at least one value column")
-        if not key_cols:
-            return [str(c) for c in values.columns], values
         present_keys = [k for k in key_cols if k in values.columns]
         val_cols = [str(c) for c in values.columns if c not in key_cols]
         if not val_cols:
@@ -386,7 +365,7 @@ class PopulationStore:
         frame: pd.DataFrame,
         operations: list[dict[str, Any]],
         delta_path: Path,
-        key_cols: list[str] | None = None,
+        key_cols: list[str],
         seen_keys: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
         for operation in operations:
@@ -420,12 +399,11 @@ class PopulationStore:
     def _replace_table(
         frame: pd.DataFrame,
         path: Path,
-        key_cols: list[str] | None = None,
+        key_cols: list[str],
         seen_keys: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
-        raw = pd.read_parquet(path)
-        new_frame = PopulationStore._normalize_keyed(raw, key_cols) if key_cols else raw
-        if key_cols and seen_keys is not None and not seen_keys.empty:
+        new_frame = PopulationStore._normalize_keyed(pd.read_parquet(path), key_cols)
+        if seen_keys is not None and not seen_keys.empty:
             retired = seen_keys.merge(frame[key_cols], on=key_cols, how="left", indicator=True)
             retired_keys = retired.loc[retired["_merge"] == "left_only", key_cols]
             if not new_frame[key_cols].merge(retired_keys, on=key_cols, how="inner").empty:
@@ -436,37 +414,37 @@ class PopulationStore:
     def _add_rows(
         frame: pd.DataFrame,
         path: Path,
-        key_cols: list[str] | None = None,
+        key_cols: list[str],
         seen_keys: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
         added = pd.read_parquet(path)
-        if key_cols and seen_keys is not None and not seen_keys.empty:
+        if seen_keys is not None and not seen_keys.empty:
             if not added[key_cols].merge(seen_keys, on=key_cols, how="inner").empty:
                 raise ValueError(f"Added rows reuse existing or previously deleted keys in {key_cols}")
         combined = pd.concat([frame, added], ignore_index=True)
-        return PopulationStore._normalize_keyed(combined, key_cols) if key_cols else combined
+        return PopulationStore._normalize_keyed(combined, key_cols)
 
     @staticmethod
-    def _delete_rows(frame: pd.DataFrame, path: Path, key_cols: list[str] | None = None) -> pd.DataFrame:
+    def _delete_rows(frame: pd.DataFrame, path: Path, key_cols: list[str]) -> pd.DataFrame:
         deleted_rows = pd.read_parquet(path)
         if not set(deleted_rows.columns).issubset(frame.columns):
             raise ValueError("Deleted rows must contain columns from the table")
         merged = frame.merge(deleted_rows.drop_duplicates(), on=list(deleted_rows.columns), how="left", indicator=True)
         result = merged.loc[merged["_merge"] == "left_only", frame.columns].reset_index(drop=True)
-        return PopulationStore._normalize_keyed(result, key_cols) if key_cols else result
+        return PopulationStore._normalize_keyed(result, key_cols)
 
     @staticmethod
     def _apply_column_file(
         frame: pd.DataFrame,
         path: Path,
-        key_cols: list[str] | None,
+        key_cols: list[str],
         *,
         expected_cols: list[str] | None,
         is_replace: bool,
     ) -> pd.DataFrame:
         col_df = pd.read_parquet(path)
-        is_keyed = bool(key_cols and set(key_cols).issubset(col_df.columns) and len(col_df.columns) > len(key_cols))
-        val_cols = [str(c) for c in col_df.columns if not (is_keyed and key_cols and c in key_cols)]
+        is_keyed = set(key_cols).issubset(col_df.columns) and len(col_df.columns) > len(key_cols)
+        val_cols = [str(c) for c in col_df.columns if not (is_keyed and c in key_cols)]
         cols_ref = expected_cols or val_cols
         label: Any = cols_ref[0] if len(cols_ref) == 1 else cols_ref
         if expected_cols is not None and val_cols != expected_cols:
@@ -478,7 +456,7 @@ class PopulationStore:
                 prefix = "Column" if is_keyed else "Replacement column"
                 raise ValueError(f"{prefix} {label!r} has {len(col_df)} values; expected {len(frame)}")
             raise ValueError("Added column must contain exactly one value for each current row")
-        if is_keyed and key_cols is not None:
+        if is_keyed:
             normalized_col = PopulationStore._normalize_keyed(col_df[[*key_cols, *val_cols]], key_cols)
             merged = frame[key_cols].merge(normalized_col, on=key_cols, how="left", indicator=True)
             if (merged["_merge"] != "both").any():
@@ -496,7 +474,7 @@ class PopulationStore:
         self,
         delta_name: str,
         delta_path: Path,
-        parent_name: str | None,
+        parent_name: str,
         parent_state: dict[str, Any],
         keys_by_table: dict[str, list[str]],
         operations_by_table: dict[str, list[dict[str, Any]]],
@@ -506,11 +484,8 @@ class PopulationStore:
         for table_name in _TABLE_NAMES:
             operations = operations_by_table.get(table_name, [])
             if not operations:
-                if parent_name is None:
-                    next_state[table_name] = copy.deepcopy(parent_state[table_name])
-                else:
-                    parent_entry = parent_state[table_name]
-                    next_state[table_name] = parent_entry if isinstance(parent_entry, str) else parent_name
+                parent_entry = parent_state[table_name]
+                next_state[table_name] = parent_entry if isinstance(parent_entry, str) else parent_name
                 continue
 
             table_state = copy.deepcopy(self._resolve_table_state(parent_state, table_name))
@@ -563,10 +538,7 @@ class PopulationStore:
     @staticmethod
     def _assign_columns_to_file(files: dict[str, list[str]], rel_path: str, cols: list[str]) -> None:
         PopulationStore._remove_columns_from_files(files, cols)
-        bucket = files.setdefault(rel_path, [])
-        for col in cols:
-            if col not in bucket:
-                bucket.append(col)
+        files.setdefault(rel_path, []).extend(cols)
 
     @staticmethod
     def _update_column_pointers(
@@ -683,21 +655,15 @@ class PopulationStore:
         return manifest_path.exists() and "state" in json.loads(manifest_path.read_text())
 
     def _load_manifest_state(self, delta_name: str) -> dict[str, Any]:
-        manifest_path = self.deltas_path / delta_name / "manifest.json"
-        if not manifest_path.exists():
+        if not self._has_state(delta_name):
             raise ValueError(f"Delta {delta_name!r} has not been committed")
-        manifest = cast(dict[str, Any], json.loads(manifest_path.read_text()))
-        if "state" not in manifest:
-            if "tables" in manifest and self._has_state(self.delta_names()[0]):
-                raise ValueError(f"Delta {delta_name!r} has not been committed")
-            raise ValueError(f"Delta {delta_name!r} predates state manifests; recreate the store")
+        manifest = cast(dict[str, Any], json.loads((self.deltas_path / delta_name / "manifest.json").read_text()))
         return cast(dict[str, Any], manifest["state"])
 
     def _resolve_delta(self, upto: str | int | None) -> str:
         deltas = self.delta_names()
         if upto is None:
-            committed = [d for d in deltas if self._has_state(d)]
-            return committed[-1] if committed else deltas[-1]
+            return [d for d in deltas if self._has_state(d)][-1]
         if upto in deltas:
             return str(upto)
         target = str(upto)
