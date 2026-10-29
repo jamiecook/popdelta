@@ -68,6 +68,23 @@ def test_create_initializes_population_directory(tmp_path):
     assert store.delta_names() == ["1_initial_commit", "2_second_commit"]
     assert Population.from_dir(population_dir / "current_state") == new_pop
 
+    current_age = new_pop.persons["age"].copy()
+    store.create_delta("column_manipulation")
+    store.add_to_current_delta(
+        table="persons",
+        columns={
+            "replace": current_age + 2,
+            "delete": ["obsolete_field"],
+            "add": pd.DataFrame({"new_column": [1, 1, 1, 1, 1, 1]}),
+        },
+    )
+    new_new_pop = store.commit_current_delta()
+    assert new_new_pop.persons.shape[0] == 6
+    assert "3_column_manipulation" in store.delta_names()
+    assert "new_column" in new_new_pop.persons.columns
+    assert "obsolete_field" not in new_new_pop.persons.columns
+    assert all(new_new_pop.persons["age"] == current_age + 2)
+
 
 def test_delta_directories_are_sorted_by_numeric_id(tmp_path):
     store = PopulationStore.create(tmp_path / "population", make_population())

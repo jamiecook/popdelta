@@ -94,7 +94,12 @@ class PopulationStore:
         delta_path.mkdir()
         return delta_path
 
-    def add_to_current_delta(self, table: str, rows: dict[str, pd.DataFrame]) -> None:
+    def add_to_current_delta(
+        self,
+        table: str,
+        rows: dict[str, pd.DataFrame] | None = None,
+        columns: dict[str, Any] | None = None,
+    ) -> None:
         if table not in _TABLE_NAMES:
             raise ValueError(f"Unknown population table: {table}")
         delta_names = self.delta_names()
@@ -108,6 +113,14 @@ class PopulationStore:
             manifest = {"name": delta_names[-1], "tables": {}}
         tables = cast(dict[str, list[dict[str, Any]]], manifest.setdefault("tables", {}))
         operations = tables.setdefault(table, [])
+        self._add_row_operations(table, delta_path, operations, rows or {})
+        self._add_column_operations(table, delta_path, operations, columns or {})
+        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+
+    @staticmethod
+    def _add_row_operations(
+        table: str, delta_path: Path, operations: list[dict[str, Any]], rows: dict[str, pd.DataFrame]
+    ) -> None:
         for action, frame in rows.items():
             if action not in {"add", "delete"}:
                 raise ValueError(f"Unsupported row action: {action}")
@@ -118,7 +131,35 @@ class PopulationStore:
             (delta_path / table).mkdir(parents=True, exist_ok=True)
             frame.to_parquet(delta_path / file_name, index=False)
             operations.append({operation: file_name})
-        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+
+    @staticmethod
+    def _add_column_operations(
+        table: str, delta_path: Path, operations: list[dict[str, Any]], columns: dict[str, Any]
+    ) -> None:
+        for action, values in columns.items():
+            if action == "delete":
+                if not isinstance(values, list):
+                    raise TypeError("Deleted columns must be a list")
+                operations.append({"delete_columns": values})
+                continue
+            if action == "replace":
+                if not isinstance(values, pd.Series):
+                    raise TypeError("Replacement column must be a pandas Series")
+                column, frame = values.name, values.to_frame()
+                operation_value = {column: f"{table}/replace_{column}_{len(operations)}.parquet"}
+                operation = "replace_columns"
+                file_name = operation_value[column]
+            elif action == "add":
+                if not isinstance(values, pd.DataFrame) or len(values.columns) != 1:
+                    raise TypeError("Added columns must be a one-column pandas DataFrame")
+                column, frame = values.columns[0], values
+                operation, file_name = "add_columns", f"{table}/add_{column}_{len(operations)}.parquet"
+                operation_value = file_name
+            else:
+                raise ValueError(f"Unsupported column action: {action}")
+            (delta_path / table).mkdir(parents=True, exist_ok=True)
+            frame.to_parquet(delta_path / file_name, index=False)
+            operations.append({operation: operation_value})
 
     def commit_current_delta(self) -> Population:
         delta_names = self.delta_names()
@@ -143,6 +184,11 @@ class PopulationStore:
                 frame = PopulationStore._delete_rows(frame, delta_path / value)
             elif action == "replace_columns":
                 frame = PopulationStore._replace_columns(frame, value, delta_path)
+            elif action == "add_columns":
+                additions = pd.read_parquet(delta_path / value)
+                if len(additions) != len(frame) or len(additions.columns) != 1:
+                    raise ValueError("Added column must contain exactly one value for each current row")
+                frame[additions.columns[0]] = additions.iloc[:, 0].to_numpy()
             elif action == "delete_columns":
                 frame = frame.drop(columns=value)
             else:
