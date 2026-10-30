@@ -163,13 +163,14 @@ modified them, so resolving any table requires at most one extra manifest read a
 }
 ```
 
-`add_rows` and `delete_rows` refer to Parquet tables. Deleting rows writes only a new key index, and
-existing column files stay valid. A column file contains the table's key columns plus one or more
-named columns (a multi-column DataFrame writes a single column-set file), and it is matched to rows
+`add_rows` and `delete_rows` refer to Parquet tables. Growing a table's row set (`add_rows`) writes a
+consolidated `state.parquet` checkpoint for that table, whereas deleting rows writes only a new key
+index and existing column files stay valid. A column file contains the table's key columns plus one or
+more named columns (a multi-column DataFrame writes a single column-set file), and it is matched to rows
 by key rather than by position. A plain Series (or single-column DataFrame without keys) is still
 accepted and is assigned in key order. Tables are always stored and returned sorted by key, with key
 columns first and newly added or replaced columns appended at the end. Keys must be unique and
-non-null, and a key that has been deleted cannot be reused by a later delta.
+non-null, and a key that has been deleted cannot be reused by a later operation or delta.
 
 Models that write complete tables can commit them directly instead of computing a diff, and
 `create_delta(..., metadata=...)` can record optional model or run provenance in the manifest:

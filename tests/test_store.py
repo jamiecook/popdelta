@@ -462,6 +462,15 @@ def test_column_validation_and_store_format_checks(tmp_path):
             columns={"add": pd.DataFrame({"person_id": [1, 2, 3, 4, 5], "age": [21, 19, 46, 43, 13]})},
         )
 
+    # Within-delta key reuse (add key 6, delete key 6, re-add key 6 in the same delta) is rejected
+    new_row = pd.DataFrame({"person_id": [6], "household_id": [2], "age": [30], "obsolete_field": [False]})
+    store.add_to_current_delta(table="persons", rows={"add": new_row})
+    store.add_to_current_delta(table="persons", rows={"delete": pd.DataFrame({"person_id": [6]})})
+    store.add_to_current_delta(table="persons", rows={"add": new_row})
+    with pytest.raises(ValueError, match="reuse existing or previously deleted keys"):
+        store.commit_current_delta()
+    store.discard_current_delta()
+
     # Verify store.json format version check and missing store.json error
     store.store_metadata_path.write_text(json.dumps({"format": 99, "tables": {}}))
     with pytest.raises(ValueError, match="Unsupported population store format: 99"):

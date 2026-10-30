@@ -368,14 +368,18 @@ class PopulationStore:
         key_cols: list[str],
         seen_keys: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
+        if seen_keys is None:
+            seen_keys = frame[key_cols]
         for operation in operations:
             if len(operation) != 1:
                 raise ValueError(f"Each operation must contain exactly one action: {operation}")
             action, value = next(iter(operation.items()))
             if action == "replace_table":
                 frame = PopulationStore._replace_table(frame, delta_path / value, key_cols, seen_keys)
+                seen_keys = pd.concat([seen_keys, frame[key_cols]], ignore_index=True).drop_duplicates()
             elif action == "add_rows":
                 frame = PopulationStore._add_rows(frame, delta_path / value, key_cols, seen_keys)
+                seen_keys = pd.concat([seen_keys, frame[key_cols]], ignore_index=True).drop_duplicates()
             elif action == "delete_rows":
                 frame = PopulationStore._delete_rows(frame, delta_path / value, key_cols)
             elif action in {"replace_columns", "add_columns"}:
